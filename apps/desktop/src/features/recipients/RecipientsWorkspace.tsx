@@ -26,6 +26,7 @@ interface RecipientsWorkspaceProps {
 const recipientsColumns = [
   { title: '邮箱', dataIndex: 'email', key: 'email' },
   { title: '姓名', dataIndex: 'name', key: 'name' },
+  { title: '研究方向', dataIndex: 'research_direction', key: 'research_direction' },
 ];
 
 const EMAIL_PATTERN = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;

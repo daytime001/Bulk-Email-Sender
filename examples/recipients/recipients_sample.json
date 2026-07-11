@@ -1,14 +1,17 @@
 [
   {
     "email": "teacher_a@example.com",
-    "name": "张教授"
+    "name": "张教授",
+    "research_direction": "电池"
   },
   {
     "email": "teacher_b@example.com",
-    "name": "李老师"
+    "name": "李老师",
+    "research_direction": "电解液"
   },
   {
     "email": "teacher_c@example.com",
-    "name": "王老师"
+    "name": "王老师",
+    "research_direction": "催化"
   }
 ]

@@ -25,9 +25,9 @@ function randomJobId(): string {
 export async function loadRecipients(path: string): Promise<LoadRecipientsResult> {
   if (!isTauriRuntime()) {
     const preview: Recipient[] = [
-      { email: 'teacher1@example.com', name: '张教授' },
-      { email: 'teacher2@example.com', name: '李教授' },
-      { email: 'teacher3@example.com', name: '王教授' },
+      { email: 'teacher1@example.com', name: '张教授', research_direction: '电池' },
+      { email: 'teacher2@example.com', name: '李教授', research_direction: '电解液' },
+      { email: 'teacher3@example.com', name: '王教授', research_direction: '催化' },
     ];
     return {
       stats: {

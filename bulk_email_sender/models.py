@@ -8,6 +8,7 @@ from pathlib import Path
 class Recipient:
     email: str
     name: str
+    research_direction: str = ""
 
 
 @dataclass(frozen=True)

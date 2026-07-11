@@ -24,6 +24,57 @@ def test_load_json_map_format(tmp_path: Path) -> None:
     assert result.stats.valid_rows == 2
 
 
+def test_load_json_list_preserves_research_direction(tmp_path: Path) -> None:
+    recipients_path = tmp_path / "teachers-with-direction.json"
+    recipients_path.write_text(
+        json.dumps(
+            [
+                {
+                    "email": "teacher@example.com",
+                    "name": "张教授",
+                    "research_direction": "电池",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = load_recipients(recipients_path)
+
+    assert result.recipients[0].research_direction == "电池"
+
+
+@pytest.mark.parametrize(
+    "path_text",
+    [
+        lambda path: f'"{path}"',
+        lambda path: f"\ufeff{path}\u200b",
+        lambda path: path.as_uri(),
+    ],
+)
+def test_load_json_normalizes_dialog_path_text(tmp_path: Path, path_text) -> None:
+    recipients_path = tmp_path / "中文 收件人.json"
+    recipients_path.write_text(
+        json.dumps({"teacher@example.com": "张教授"}),
+        encoding="utf-8",
+    )
+
+    result = load_recipients(path_text(recipients_path))
+
+    assert result.stats.valid_rows == 1
+
+
+def test_load_json_supports_gb18030_encoded_file(tmp_path: Path) -> None:
+    recipients_path = tmp_path / "gbk-teachers.json"
+    recipients_path.write_bytes(
+        json.dumps({"teacher@example.com": "张教授"}, ensure_ascii=False).encode("gb18030")
+    )
+
+    result = load_recipients(recipients_path)
+
+    assert result.recipients[0].name == "张教授"
+
+
 def test_load_xlsx_with_headers_and_duplicate_rows(tmp_path: Path) -> None:
     recipients_path = tmp_path / "teachers.xlsx"
     workbook = Workbook()
@@ -42,6 +93,19 @@ def test_load_xlsx_with_headers_and_duplicate_rows(tmp_path: Path) -> None:
     ]
     assert result.stats.duplicate_rows == 1
     assert result.stats.invalid_rows == 0
+
+
+def test_load_xlsx_with_research_direction_header(tmp_path: Path) -> None:
+    recipients_path = tmp_path / "teachers-direction.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["邮箱", "姓名", "研究方向"])
+    sheet.append(["teacher@example.com", "张教授", "电解液"])
+    workbook.save(recipients_path)
+
+    result = load_recipients(recipients_path)
+
+    assert result.recipients[0].research_direction == "电解液"
 
 
 def test_load_xlsx_without_headers_uses_ab_columns(tmp_path: Path) -> None:

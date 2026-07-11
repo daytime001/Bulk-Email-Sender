@@ -72,21 +72,21 @@ function SettingsWorkspaceInner({
               <div className="flex flex-wrap items-center gap-2">
                 <UiBadge variant="secondary" className="bg-teal-100 text-teal-700">
                   <ShieldCheck className="size-3.5" />
-                  Python 运行时
+                  Python 运行环境
                 </UiBadge>
                 <UiBadge variant="outline" className={runtimeBadgeClass}>
                   {runtimeBadgeText}
                 </UiBadge>
               </div>
               <UiCardTitle className="text-xl text-slate-900">运行环境</UiCardTitle>
-              <UiCardDescription>建议先确认运行时状态，再进行邮件发送。</UiCardDescription>
+              <UiCardDescription>建议先确认运行环境状态，再进行邮件发送。</UiCardDescription>
             </UiCardHeader>
             <UiCardContent className="settings-runtime-content space-y-4 px-6 pb-6">
               {runtimeStatus && (
                 <Alert
                   type={runtimeReady ? 'success' : 'warning'}
                   showIcon
-                  message={runtimeReady ? 'Python 运行时已就绪' : '需要先配置 Python 运行时'}
+                  message={runtimeReady ? 'Python 运行环境已就绪' : '需要先配置 Python 运行环境'}
                   description={`来源：${runtimeStatus.source}${runtimeStatus.version ? ` ｜ ${runtimeStatus.version}` : ''} ｜ ${runtimeStatus.message}`}
                 />
               )}
@@ -116,7 +116,7 @@ function SettingsWorkspaceInner({
                   disabled={runtimeBusy}
                   onClick={onAutoDetectRuntime}
                 >
-                  自动安装 Python（推荐）
+                  自动配置运行环境（推荐）
                 </UiButton>
                 <UiButton
                   type="button"

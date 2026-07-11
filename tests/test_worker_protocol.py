@@ -1,9 +1,10 @@
 import json
 import threading
+from io import StringIO
 from pathlib import Path
 
 from bulk_email_sender.models import JobConfig, Recipient, Sender, SendOptions, SMTPConfig, Template
-from bulk_email_sender.worker import Worker, _build_job_config
+from bulk_email_sender.worker import JsonLineWriter, Worker, _build_job_config
 
 
 class DummyWriter:
@@ -12,6 +13,17 @@ class DummyWriter:
 
     def write_line(self, payload):
         self.lines.append(payload)
+
+
+def test_json_line_writer_uses_ascii_safe_protocol_output() -> None:
+    stream = StringIO()
+    writer = JsonLineWriter(stream=stream)
+
+    writer.write_line({"type": "recipients_loaded", "name": "张教授"})
+
+    output = stream.getvalue()
+    assert output.isascii()
+    assert json.loads(output)["name"] == "张教授"
 
 
 def test_worker_load_recipients_command(tmp_path: Path) -> None:
@@ -63,6 +75,33 @@ def test_worker_load_recipients_command_returns_quality_stats(tmp_path: Path) ->
     assert writer.lines[-1]["stats"]["sendable_rows"] == 2
     assert writer.lines[-1]["stats"]["invalid_email_rows"] == 1
     assert writer.lines[-1]["stats"]["missing_name_rows"] == 1
+
+
+def test_build_job_config_preserves_research_direction() -> None:
+    job = _build_job_config(
+        {
+            "sender": {"email": "sender@example.com", "name": "发件人"},
+            "smtp": {
+                "host": "smtp.example.com",
+                "port": 465,
+                "username": "sender@example.com",
+                "password": "secret",
+            },
+            "template": {
+                "subject": "咨询{research_direction}",
+                "body_text": "正文{research_direction}",
+            },
+            "recipients": [
+                {
+                    "email": "teacher@example.com",
+                    "name": "张教授",
+                    "research_direction": "电池",
+                }
+            ],
+        }
+    )
+
+    assert job.recipients[0].research_direction == "电池"
 
 
 def test_worker_unknown_command_returns_error() -> None:

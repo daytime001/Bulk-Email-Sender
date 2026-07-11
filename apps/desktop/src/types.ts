@@ -23,6 +23,7 @@ export type WorkerEvent =
 export interface Recipient {
   email: string;
   name: string;
+  research_direction?: string;
 }
 
 export interface RecipientStats {

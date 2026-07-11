@@ -12,6 +12,7 @@ from typing import Any
 
 PYTHON_MIN_MAJOR = 3
 PYTHON_MIN_MINOR = 9
+REQUIRED_RUNTIME_IMPORTS = ("openpyxl",)
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,9 @@ def validate_runtime_root(runtime_root: Path) -> Path:
         if version is None:
             continue
         if _is_supported_python_version(version):
+            missing_imports = _missing_runtime_imports(candidate)
+            if missing_imports:
+                raise ValueError(f"runtime_root 缺少必需 Python 包: {', '.join(missing_imports)}")
             return candidate
         parsed_versions.append((candidate, version))
 
@@ -104,6 +108,26 @@ def _probe_python_version(python_path: Path) -> tuple[int, int, int] | None:
 def _is_supported_python_version(version: tuple[int, int, int]) -> bool:
     major, minor, _patch = version
     return major > PYTHON_MIN_MAJOR or (major == PYTHON_MIN_MAJOR and minor >= PYTHON_MIN_MINOR)
+
+
+def _missing_runtime_imports(python_path: Path) -> list[str]:
+    missing: list[str] = []
+    for module_name in REQUIRED_RUNTIME_IMPORTS:
+        try:
+            result = subprocess.run(
+                [str(python_path), "-c", f"import {module_name}"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            missing.append(module_name)
+            continue
+
+        if result.returncode != 0:
+            missing.append(module_name)
+    return missing
 
 
 def calculate_sha256(file_path: Path) -> str:

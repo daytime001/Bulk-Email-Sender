@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 from bulk_email_sender.models import Recipient
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 EMAIL_HEADERS = {"email", "e-mail", "邮箱", "邮箱地址"}
 NAME_HEADERS = {"name", "姓名", "导师姓名", "老师姓名"}
+RESEARCH_DIRECTION_HEADERS = {
+    "research_direction",
+    "research direction",
+    "direction",
+    "research",
+    "研究方向",
+    "研究领域",
+    "方向",
+}
+RESEARCH_DIRECTION_KEYS = ("research_direction", "researchDirection", "direction", "research", "研究方向")
 
 
 class RecipientLoadError(ValueError):
@@ -40,7 +52,7 @@ def load_recipients(
     *,
     raise_on_invalid: bool = True,
 ) -> RecipientLoadResult:
-    path = Path(file_path)
+    path = _normalize_input_path(file_path)
     if not path.exists():
         raise RecipientLoadError(f"Recipient file not found: {path}")
 
@@ -55,27 +67,63 @@ def load_recipients(
     return _normalize_rows(rows, raise_on_invalid=raise_on_invalid)
 
 
-def _load_json_rows(path: Path) -> list[tuple[int, object, object]]:
-    with path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
+def _normalize_input_path(file_path: str | Path) -> Path:
+    if isinstance(file_path, Path):
+        return file_path
 
-    rows: list[tuple[int, object, object]] = []
+    text = os.fsdecode(file_path).strip().strip("\ufeff\u200b\u200c\u200d\u2060")
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1].strip().strip("\ufeff\u200b\u200c\u200d\u2060")
+
+    parsed = urlparse(text)
+    if parsed.scheme.lower() == "file":
+        path_text = unquote(parsed.path)
+        if parsed.netloc and parsed.netloc.lower() != "localhost":
+            path_text = f"//{parsed.netloc}{path_text}"
+        if re.match(r"^/[A-Za-z]:[\\/]", path_text):
+            path_text = path_text[1:]
+        return Path(path_text)
+
+    return Path(text)
+
+
+def _load_json_rows(path: Path) -> list[tuple[int, object, object, object]]:
+    payload = json.loads(_read_json_text(path))
+
+    rows: list[tuple[int, object, object, object]] = []
     if isinstance(payload, dict):
         for index, (email, name) in enumerate(payload.items(), start=1):
-            rows.append((index, email, name))
+            rows.append((index, email, name, None))
         return rows
 
     if isinstance(payload, list):
         for index, item in enumerate(payload, start=1):
             if not isinstance(item, dict):
                 raise RecipientLoadError(f"Invalid JSON row at index {index}: expected object")
-            rows.append((index, item.get("email"), item.get("name")))
+            rows.append((index, item.get("email"), item.get("name"), _get_research_direction_value(item)))
         return rows
 
     raise RecipientLoadError("Invalid JSON format: expected object or list")
 
 
-def _load_xlsx_rows(path: Path) -> list[tuple[int, object, object]]:
+def _read_json_text(path: Path) -> str:
+    errors: list[str] = []
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            return path.read_text(encoding=encoding)
+        except UnicodeDecodeError as exc:
+            errors.append(f"{encoding}: {exc}")
+    raise RecipientLoadError("JSON 文件编码无法识别，请另存为 UTF-8 后重试：" + " | ".join(errors))
+
+
+def _get_research_direction_value(item: dict[str, object]) -> object:
+    for key in RESEARCH_DIRECTION_KEYS:
+        if key in item:
+            return item.get(key)
+    return None
+
+
+def _load_xlsx_rows(path: Path) -> list[tuple[int, object, object, object]]:
     from openpyxl import load_workbook
 
     workbook = load_workbook(filename=path, read_only=True, data_only=True)
@@ -94,39 +142,47 @@ def _load_xlsx_rows(path: Path) -> list[tuple[int, object, object]]:
 
     if header_map is None:
         if _looks_like_email(_cell_to_text(first_row[0] if len(first_row) > 0 else None)):
-            email_idx, name_idx = 0, 1
+            email_idx, name_idx, research_direction_idx = 0, 1, 2
         else:
             raise RecipientLoadError(
                 "Unable to detect XLSX columns. Use headers '邮箱/姓名' "
                 "or place email in column A and name in column B."
             )
     else:
-        email_idx, name_idx = header_map
+        email_idx, name_idx, research_direction_idx = header_map
 
-    rows: list[tuple[int, object, object]] = []
+    rows: list[tuple[int, object, object, object]] = []
     for row_number, row in enumerate(data_rows, start=2 if header_map else 1):
         email = row[email_idx] if len(row) > email_idx else None
         name = row[name_idx] if len(row) > name_idx else None
-        rows.append((row_number, email, name))
+        research_direction = (
+            row[research_direction_idx]
+            if research_direction_idx is not None and len(row) > research_direction_idx
+            else None
+        )
+        rows.append((row_number, email, name, research_direction))
     return rows
 
 
-def _detect_header_map(row: Iterable[object]) -> tuple[int, int] | None:
+def _detect_header_map(row: Iterable[object]) -> tuple[int, int, int | None] | None:
     normalized = [_cell_to_text(value).strip().lower() for value in row]
     email_idx = None
     name_idx = None
+    research_direction_idx = None
     for idx, value in enumerate(normalized):
         if value in EMAIL_HEADERS and email_idx is None:
             email_idx = idx
         if value in NAME_HEADERS and name_idx is None:
             name_idx = idx
+        if value in RESEARCH_DIRECTION_HEADERS and research_direction_idx is None:
+            research_direction_idx = idx
     if email_idx is None or name_idx is None:
         return None
-    return email_idx, name_idx
+    return email_idx, name_idx, research_direction_idx
 
 
 def _normalize_rows(
-    rows: list[tuple[int, object, object]],
+    rows: list[tuple[int, object, object, object]],
     *,
     raise_on_invalid: bool,
 ) -> RecipientLoadResult:
@@ -139,11 +195,12 @@ def _normalize_rows(
     duplicate_rows = 0
     empty_rows = 0
 
-    for row_number, raw_email, raw_name in rows:
+    for row_number, raw_email, raw_name, raw_research_direction in rows:
         email = _cell_to_text(raw_email).strip()
         name = _cell_to_text(raw_name).strip()
+        research_direction = _cell_to_text(raw_research_direction).strip()
 
-        if not email and not name:
+        if not email and not name and not research_direction:
             empty_rows += 1
             continue
 
@@ -164,7 +221,7 @@ def _normalize_rows(
             continue
 
         seen.add(email_key)
-        recipients.append(Recipient(email=email, name=name))
+        recipients.append(Recipient(email=email, name=name, research_direction=research_direction))
 
     if raise_on_invalid and invalid_messages:
         details = "; ".join(invalid_messages[:20])

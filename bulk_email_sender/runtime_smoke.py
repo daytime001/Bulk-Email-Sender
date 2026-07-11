@@ -36,7 +36,7 @@ def prepare_local_runtime_smoke(
     base_dir.mkdir(parents=True, exist_ok=True)
 
     runtime_root = base_dir / "mock_runtime"
-    create_mock_runtime(runtime_root=runtime_root, python_version=python_version)
+    create_mock_runtime(runtime_root=runtime_root, python_version=python_version, installed_imports=("openpyxl",))
 
     bundle_path = base_dir / f"python-runtime-{normalized_target}.zip"
     build_runtime_bundle(runtime_root=runtime_root, bundle_path=bundle_path)
@@ -61,14 +61,14 @@ def prepare_local_runtime_smoke(
     )
 
 
-def create_mock_runtime(*, runtime_root: Path, python_version: str) -> Path:
+def create_mock_runtime(*, runtime_root: Path, python_version: str, installed_imports: tuple[str, ...] = ()) -> Path:
     output_root = Path(runtime_root).expanduser().resolve()
     bin_dir = output_root / "bin"
     lib_dir = output_root / "lib"
     bin_dir.mkdir(parents=True, exist_ok=True)
     lib_dir.mkdir(parents=True, exist_ok=True)
 
-    launcher_content = build_launcher_script(python_version)
+    launcher_content = build_launcher_script(python_version, installed_imports=installed_imports)
     python3_path = bin_dir / "python3"
     python_path = bin_dir / "python"
 
@@ -84,7 +84,17 @@ def create_mock_runtime(*, runtime_root: Path, python_version: str) -> Path:
     return output_root
 
 
-def build_launcher_script(version: str) -> str:
+def build_launcher_script(version: str, *, installed_imports: tuple[str, ...] = ()) -> str:
+    missing_import_guards = []
+    for module_name in ("openpyxl",):
+        if module_name not in installed_imports:
+            missing_import_guards.append(
+                f"""if [[ "${{1:-}}" == "-c" && "${{2:-}}" == *"{module_name}"* ]]; then
+  echo "ModuleNotFoundError: No module named '{module_name}'" >&2
+  exit 1
+fi"""
+            )
+    guard_script = "\n\n".join(missing_import_guards)
     return f"""#!/usr/bin/env bash
 set -euo pipefail
 
@@ -92,6 +102,8 @@ if [[ "${{1:-}}" == "--version" ]]; then
   echo "Python {version}"
   exit 0
 fi
+
+{guard_script}
 
 exec /usr/bin/env python3 "$@"
 """

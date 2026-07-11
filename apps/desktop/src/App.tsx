@@ -513,9 +513,9 @@ function AppContent() {
       const status = await autoDetectRuntime();
       setRuntimeStatus(status);
       setRuntimePath(status.executable_path ?? '');
-      message.success('Python 运行时配置成功');
+      message.success('运行环境配置成功');
     } catch (error) {
-      message.error(toErrMsg(error, '自动检测 Python 失败'));
+      message.error(toErrMsg(error, '自动配置运行环境失败'));
     } finally {
       setRuntimeBusy(false);
     }

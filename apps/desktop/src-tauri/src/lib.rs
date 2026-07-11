@@ -1,8 +1,9 @@
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Tls, TlsParameters};
-use lettre::{SmtpTransport};
+use lettre::SmtpTransport;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
@@ -14,7 +15,6 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use walkdir::WalkDir;
 use zip::ZipArchive;
-use sha2::{Digest, Sha256};
 
 const WORKER_EVENT_CHANNEL: &str = "worker-event";
 const RUNTIME_CONFIG_RELATIVE_PATH: &str = "runtime/python_runtime.json";
@@ -26,6 +26,32 @@ const SAMPLE_RECIPIENT_JSON_FILE: &str = "recipients_sample.json";
 const SAMPLE_RECIPIENT_XLSX_FILE: &str = "recipients_sample.xlsx";
 const PYTHON_MIN_MAJOR: u32 = 3;
 const PYTHON_MIN_MINOR: u32 = 9;
+const REQUIRED_PYTHON_PACKAGES: &[&str] = &["openpyxl>=3.1.5,<4"];
+const REQUIRED_PYTHON_IMPORTS: &[&str] = &["openpyxl"];
+const PIP_RETRIES: &str = "5";
+const PIP_TIMEOUT_SECS: &str = "45";
+const HTTP_DOWNLOAD_RETRIES: u32 = 3;
+const HTTP_DOWNLOAD_TIMEOUT_SECS: u64 = 60;
+#[cfg(target_os = "windows")]
+const WINDOWS_PYTHON_VERSION: &str = "3.11.9";
+#[cfg(target_os = "windows")]
+const WINDOWS_PYTHON_INSTALLER_NAME: &str = "python-3.11.9-amd64.exe";
+#[cfg(target_os = "windows")]
+const WINDOWS_PYTHON_INSTALLER_URLS: &[&str] = &[
+    "https://mirror.nju.edu.cn/python/3.11.9/python-3.11.9-amd64.exe",
+    "https://mirrors.aliyun.com/python-release/windows/python-3.11.9-amd64.exe",
+    "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe",
+];
+const UV_PYTHON_INSTALL_MIRRORS: &[Option<&str>] = &[
+    Some("https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone/"),
+    Some("https://mirror.nju.edu.cn/github-release/indygreg/python-build-standalone/"),
+    None,
+];
+const PIP_INDEX_URLS: &[Option<&str>] = &[
+    Some("https://pypi.tuna.tsinghua.edu.cn/simple"),
+    Some("https://mirrors.aliyun.com/pypi/simple"),
+    None,
+];
 
 #[derive(Default)]
 struct WorkerState {
@@ -45,11 +71,14 @@ struct SmtpPayload {
 
 #[tauri::command]
 fn load_recipients(app: AppHandle, path: String) -> Result<Value, String> {
-    run_worker_request(json!({
-        "type": "load_recipients",
-        "protocol": 1,
-        "payload": { "path": path }
-    }), &app)
+    run_worker_request(
+        json!({
+            "type": "load_recipients",
+            "protocol": 1,
+            "payload": { "path": path }
+        }),
+        &app,
+    )
 }
 
 #[tauri::command]
@@ -109,11 +138,7 @@ fn start_send(
         .map_err(|_| "failed to acquire worker state lock".to_string())?;
 
     if let Some(child) = guard.as_mut() {
-        if child
-            .try_wait()
-            .map_err(|err| err.to_string())?
-            .is_none()
-        {
+        if child.try_wait().map_err(|err| err.to_string())?.is_none() {
             return Err("another job is running".to_string());
         }
         *guard = None;
@@ -208,8 +233,7 @@ fn load_app_draft(app: AppHandle) -> Result<Value, String> {
     if !draft_path.exists() {
         return Ok(json!({}));
     }
-    let text = fs::read_to_string(&draft_path)
-        .map_err(|err| format!("读取草稿配置失败: {err}"))?;
+    let text = fs::read_to_string(&draft_path).map_err(|err| format!("读取草稿配置失败: {err}"))?;
     serde_json::from_str(&text).map_err(|err| format!("草稿配置格式错误: {err}"))
 }
 
@@ -365,7 +389,10 @@ fn clear_runtime_python(app: AppHandle) -> Result<RuntimeStatus, String> {
 }
 
 #[tauri::command]
-fn install_runtime_from_archive(app: AppHandle, archive_path: String) -> Result<RuntimeStatus, String> {
+fn install_runtime_from_archive(
+    app: AppHandle,
+    archive_path: String,
+) -> Result<RuntimeStatus, String> {
     let source_path = PathBuf::from(archive_path.trim());
     if !source_path.exists() {
         return Err("运行时压缩包不存在".to_string());
@@ -411,7 +438,8 @@ fn auto_install_runtime(
         }
     }
 
-    let bundle = selected_bundle.ok_or_else(|| format!("自动安装失败：{}", manifest_errors.join(" | ")))?;
+    let bundle =
+        selected_bundle.ok_or_else(|| format!("自动安装失败：{}", manifest_errors.join(" | ")))?;
 
     let runtime_root = runtime_root_dir(&app)?;
     let download_dir = runtime_root.join("downloads");
@@ -436,7 +464,10 @@ fn auto_install_runtime(
         }
     }
     if !downloaded {
-        return Err(format!("runtime 包下载失败：{}", download_errors.join(" | ")));
+        return Err(format!(
+            "runtime 包下载失败：{}",
+            download_errors.join(" | ")
+        ));
     }
 
     if let Some(checksum) = &bundle.sha256 {
@@ -454,62 +485,79 @@ const UV_INSTALL_RETRIES: u32 = 3;
 const UV_RETRY_SLEEP_SECS: u64 = 4;
 
 /// 自动探测并配置 Python 运行时：
-///   1. 查找已有 uv → 查找 / 安装 Python 3.11
-///   2. uv 不存在 → 自动安装 uv（带重试），再执行 1
+///   1. Windows：直接从国内镜像下载官方 Python 安装器并配置应用专用环境
+///   2. 非 Windows：优先使用 uv 查找 / 安装 Python
 ///   3. 全部失败 → 回退系统 python3 / python
 #[tauri::command]
 fn auto_detect_runtime(app: AppHandle) -> Result<RuntimeStatus, String> {
+    #[cfg(not(target_os = "windows"))]
     let mut uv_install_err: Option<String> = None;
+    let mut runtime_prepare_errors: Vec<String> = Vec::new();
 
-    let uv_opt = find_uv_executable().or_else(|| {
-        match install_uv() {
+    #[cfg(target_os = "windows")]
+    match install_windows_python_from_mirrors(&app) {
+        Ok((python, version)) => match save_configured_runtime(&app, python, version) {
+            Ok(status) => return Ok(status),
+            Err(err) => runtime_prepare_errors.push(format!("配置国内镜像 Python 失败：{err}")),
+        },
+        Err(err) => runtime_prepare_errors.push(format!("从国内镜像下载 Python 失败：{err}")),
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let uv_opt = find_uv_executable().or_else(|| match install_uv() {
             Ok(p) => Some(p),
-            Err(e) => { uv_install_err = Some(e); None }
-        }
-    });
+            Err(e) => {
+                uv_install_err = Some(e);
+                None
+            }
+        });
 
-    if let Some(uv) = uv_opt {
-        // 1a. 查找 uv 已管理的 Python（任意 >=3.9）
-        if let Ok(out) = Command::new(&uv).args(["python", "find"]).output() {
-            if out.status.success() {
-                let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !p.is_empty() {
-                    let c = PathBuf::from(&p);
-                    if let Some(ver) = probe_python_version(&c) {
-                        if is_supported_python_version(&ver) {
-                            return save_configured_runtime(&app, c, ver);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 1b. 通过 uv 安装 Python 3.11，最多重试 UV_INSTALL_RETRIES 次
-        let mut py_ok = false;
-        for attempt in 1..=UV_INSTALL_RETRIES {
-            if let Ok(out) = Command::new(&uv).args(["python", "install", "3.11"]).output() {
-                if out.status.success() { py_ok = true; break; }
-            }
-            if attempt < UV_INSTALL_RETRIES {
-                std::thread::sleep(std::time::Duration::from_secs(UV_RETRY_SLEEP_SECS));
-            }
-        }
-        if py_ok {
-            if let Ok(out) = Command::new(&uv).args(["python", "find", "3.11"]).output() {
+        if let Some(uv) = uv_opt {
+            // 1a. 查找 uv 已管理的 Python（任意 >=3.9）
+            if let Ok(out) = Command::new(&uv).args(["python", "find"]).output() {
                 if out.status.success() {
                     let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     if !p.is_empty() {
                         let c = PathBuf::from(&p);
                         if let Some(ver) = probe_python_version(&c) {
                             if is_supported_python_version(&ver) {
-                                return save_configured_runtime(&app, c, ver);
+                                match save_configured_runtime(&app, c, ver) {
+                                    Ok(status) => return Ok(status),
+                                    Err(err) => runtime_prepare_errors
+                                        .push(format!("配置 uv 已有 Python 失败：{err}")),
+                                }
                             }
                         }
                     }
                 }
             }
+
+            // 1b. 通过 uv 从国内镜像安装 Python 3.11，失败后再回退官方源。
+            match install_uv_python(&uv) {
+                Ok(()) => {
+                    if let Ok(out) = Command::new(&uv).args(["python", "find", "3.11"]).output() {
+                        if out.status.success() {
+                            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            if !p.is_empty() {
+                                let c = PathBuf::from(&p);
+                                if let Some(ver) = probe_python_version(&c) {
+                                    if is_supported_python_version(&ver) {
+                                        match save_configured_runtime(&app, c, ver) {
+                                            Ok(status) => return Ok(status),
+                                            Err(err) => runtime_prepare_errors
+                                                .push(format!("配置 uv 新安装 Python 失败：{err}")),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err) => runtime_prepare_errors.push(format!("下载 Python 3.11 失败：{err}")),
+            };
+            // uv python install 失败（如网络差），继续回退
         }
-        // uv python install 失败（如网络差），继续回退
     }
 
     // 2. 回退到系统 Python
@@ -522,39 +570,126 @@ fn auto_detect_runtime(app: AppHandle) -> Result<RuntimeStatus, String> {
         let exe = PathBuf::from(name);
         if let Some(ver) = probe_python_version(&exe) {
             if is_supported_python_version(&ver) {
-                return save_configured_runtime(&app, exe, ver);
+                match save_configured_runtime(&app, exe, ver) {
+                    Ok(status) => return Ok(status),
+                    Err(err) => {
+                        runtime_prepare_errors.push(format!("配置系统 Python `{name}` 失败：{err}"))
+                    }
+                }
             }
         }
     }
 
     // 3. 全部失败：给出有针对性的错误提示
     let base = "未找到可用的 Python 运行时（需 ≥3.9）。";
-    let hint = "https://docs.astral.sh/uv/getting-started/installation/";
-    if let Some(uv_err) = uv_install_err {
-        Err(format!(
-            "{base}\n\n安装 uv 失败：{uv_err}\n\n建议：\n① 检查网络后点击「自动安装 Python」重试\n② 或访问 {hint} 手动安装 uv\n③ 或点击「选择 Python 文件」指定已有 Python"
-        ))
+    let prepare_hint = if runtime_prepare_errors.is_empty() {
+        String::new()
     } else {
+        format!(
+            "\n\n已找到 Python，但完整环境准备失败：\n{}",
+            runtime_prepare_errors.join("\n")
+        )
+    };
+    #[cfg(target_os = "windows")]
+    {
         Err(format!(
-            "{base}\n\n建议：\n① 检查网络后点击「自动安装 Python」重试\n② 或访问 {hint} 安装 uv\n③ 或点击「选择 Python 文件」指定已有 Python"
+            "{base}{prepare_hint}\n\n建议：\n① 检查网络后点击「自动配置运行环境」重试\n② 或点击「选择 Python 文件」指定已有 Python"
         ))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let hint = "https://docs.astral.sh/uv/getting-started/installation/";
+        if let Some(uv_err) = uv_install_err {
+            Err(format!(
+                "{base}{prepare_hint}\n\n安装 uv 失败：{uv_err}\n\n建议：\n① 检查网络后点击「自动配置运行环境」重试\n② 或访问 {hint} 手动安装 uv\n③ 或点击「选择 Python 文件」指定已有 Python"
+            ))
+        } else {
+            Err(format!(
+                "{base}{prepare_hint}\n\n建议：\n① 检查网络后点击「自动配置运行环境」重试\n② 或访问 {hint} 安装 uv\n③ 或点击「选择 Python 文件」指定已有 Python"
+            ))
+        }
     }
 }
 
 /// 查找已安装的 uv 可执行文件（PATH + 平台默认路径）。
 fn find_uv_executable() -> Option<PathBuf> {
     // 优先 PATH
-    if Command::new("uv").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+    if is_working_uv_executable(Path::new("uv")) {
         return Some(PathBuf::from("uv"));
     }
     for path in uv_default_paths() {
-        if path.exists()
-            && Command::new(&path).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
-        {
+        if is_working_uv_executable(&path) {
             return Some(path);
         }
     }
     None
+}
+
+fn is_working_uv_executable(path: &Path) -> bool {
+    Command::new(path)
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn install_windows_python_from_mirrors(app: &AppHandle) -> Result<(PathBuf, String), String> {
+    let runtime_root = runtime_root_dir(app)?;
+    let download_dir = runtime_root.join("downloads");
+    fs::create_dir_all(&download_dir).map_err(|err| format!("创建下载目录失败: {err}"))?;
+    let installer_path = download_dir.join(WINDOWS_PYTHON_INSTALLER_NAME);
+    let install_dir = runtime_root.join(format!("python-{WINDOWS_PYTHON_VERSION}"));
+    let python = install_dir.join("python.exe");
+
+    if !python.exists() {
+        let mut errors: Vec<String> = Vec::new();
+        let mut downloaded = false;
+        for url in WINDOWS_PYTHON_INSTALLER_URLS {
+            match download_bundle_to_path(url, &installer_path) {
+                Ok(()) => {
+                    downloaded = true;
+                    break;
+                }
+                Err(err) => errors.push(format!("{url}：{}", compact_error_for_user(&err))),
+            }
+        }
+        if !downloaded {
+            return Err(format!(
+                "已尝试南京大学镜像、阿里云镜像和官方源，仍无法下载 Python。\n{}",
+                errors.join("\n")
+            ));
+        }
+
+        fs::create_dir_all(&install_dir)
+            .map_err(|err| format!("创建 Python 安装目录失败: {err}"))?;
+        run_command_capture_with_retries(
+            Command::new(&installer_path).args(build_windows_python_installer_args(&install_dir)),
+            "安装 Python",
+        )?;
+    }
+
+    let version =
+        probe_python_version(&python).ok_or_else(|| "安装后的 Python 不可执行".to_string())?;
+    if !is_supported_python_version(&version) {
+        return Err(format!(
+            "安装后的 Python 版本过低，当前为 `{version}`，要求 >= {}.{}",
+            PYTHON_MIN_MAJOR, PYTHON_MIN_MINOR
+        ));
+    }
+    Ok((python, version))
+}
+
+#[cfg(target_os = "windows")]
+fn build_windows_python_installer_args(install_dir: &Path) -> Vec<String> {
+    vec![
+        "/quiet".to_string(),
+        "InstallAllUsers=0".to_string(),
+        "PrependPath=0".to_string(),
+        "Include_pip=1".to_string(),
+        "Include_test=0".to_string(),
+        format!("TargetDir={}", install_dir.to_string_lossy()),
+    ]
 }
 
 /// 平台相关的 uv 默认安装位置。
@@ -582,6 +717,34 @@ fn uv_default_paths() -> Vec<PathBuf> {
     paths
 }
 
+fn install_uv_python(uv: &Path) -> Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+    for mirror in UV_PYTHON_INSTALL_MIRRORS {
+        match run_uv_python_install(uv, *mirror) {
+            Ok(()) => return Ok(()),
+            Err(err) => errors.push(format!(
+                "{}：{}",
+                mirror.unwrap_or("官方源"),
+                compact_error_for_user(&err)
+            )),
+        }
+    }
+
+    Err(format!(
+        "已尝试南京大学镜像和官方源，仍无法下载 Python。请切换网络或稍后重试。\n{}",
+        errors.join("\n")
+    ))
+}
+
+fn run_uv_python_install(uv: &Path, mirror: Option<&str>) -> Result<(), String> {
+    let mut command = Command::new(uv);
+    command.args(["python", "install", "3.11"]);
+    if let Some(url) = mirror {
+        command.env("UV_PYTHON_INSTALL_MIRROR", url);
+    }
+    run_command_capture_with_retries(&mut command, "下载 Python")
+}
+
 /// 通过官方脚本自动安装 uv（跨平台，带重试），成功后返回可执行路径。
 fn install_uv() -> Result<PathBuf, String> {
     let mut last_err = String::new();
@@ -592,7 +755,10 @@ fn install_uv() -> Result<PathBuf, String> {
             {
                 Command::new("powershell")
                     .args([
-                        "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
                         "irm https://astral.sh/uv/install.ps1 | iex",
                     ])
                     .stdout(std::process::Stdio::null())
@@ -615,11 +781,18 @@ fn install_uv() -> Result<PathBuf, String> {
 
         if ok {
             // 安装成功，在默认路径中寻找
-            if Command::new("uv").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+            if Command::new("uv")
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
                 return Ok(PathBuf::from("uv"));
             }
             for p in uv_default_paths() {
-                if p.exists() { return Ok(p); }
+                if p.exists() {
+                    return Ok(p);
+                }
             }
             return Err("uv 安装完成，但未找到可执行文件，请重启应用后重试。".to_string());
         }
@@ -635,17 +808,194 @@ fn install_uv() -> Result<PathBuf, String> {
     ))
 }
 
-fn save_configured_runtime(app: &AppHandle, path: PathBuf, version: String) -> Result<RuntimeStatus, String> {
+fn save_configured_runtime(
+    app: &AppHandle,
+    path: PathBuf,
+    version: String,
+) -> Result<RuntimeStatus, String> {
+    let runtime_python = prepare_managed_python_runtime(app, &path)?;
+    let runtime_version = probe_python_version(&runtime_python).unwrap_or(version);
+
     let mut config = read_runtime_config(app)?;
-    config.python_path = Some(path.to_string_lossy().to_string());
+    config.python_path = Some(runtime_python.to_string_lossy().to_string());
     write_runtime_config(app, &config)?;
     Ok(RuntimeStatus {
         ready: true,
         source: "configured".to_string(),
-        executable_path: Some(path.to_string_lossy().to_string()),
-        version: Some(version),
-        message: "Python 运行时已就绪".to_string(),
+        executable_path: Some(runtime_python.to_string_lossy().to_string()),
+        version: Some(runtime_version),
+        message: "Python 运行时与依赖已就绪".to_string(),
     })
+}
+
+fn prepare_managed_python_runtime(app: &AppHandle, base_python: &Path) -> Result<PathBuf, String> {
+    let venv_dir = runtime_root_dir(app)?.join("venv");
+    let venv_python = managed_venv_python_path(&venv_dir);
+
+    if !venv_python.exists() {
+        if venv_dir.exists() {
+            fs::remove_dir_all(&venv_dir)
+                .map_err(|err| format!("清理旧 Python 环境失败: {err}"))?;
+        }
+        fs::create_dir_all(
+            venv_dir
+                .parent()
+                .ok_or_else(|| "无法解析 Python 环境目录".to_string())?,
+        )
+        .map_err(|err| format!("创建 Python 环境目录失败: {err}"))?;
+        run_command_capture(
+            Command::new(base_python)
+                .args(["-m", "venv"])
+                .arg(&venv_dir),
+            "创建应用专用 Python 环境",
+        )?;
+    }
+
+    let _ = run_command_capture(
+        Command::new(&venv_python).args(["-m", "ensurepip", "--upgrade"]),
+        "初始化 pip",
+    );
+    install_required_python_packages(&venv_python)?;
+    ensure_required_python_imports(&venv_python)?;
+    Ok(venv_python)
+}
+
+fn install_required_python_packages(python: &Path) -> Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+    for index_url in PIP_INDEX_URLS {
+        let args = build_pip_install_args(*index_url);
+        match run_command_capture(Command::new(python).args(args), "安装 Python 依赖") {
+            Ok(()) => return Ok(()),
+            Err(err) => errors.push(format!(
+                "{}：{}",
+                index_url.unwrap_or("官方 PyPI"),
+                compact_error_for_user(&err)
+            )),
+        }
+    }
+
+    Err(format!(
+        "安装 Python 依赖失败。已尝试官方 PyPI、清华镜像和阿里云镜像，仍无法下载。请切换网络或稍后重试。\n{}",
+        errors.join("\n")
+    ))
+}
+
+fn build_pip_install_args(index_url: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "-m".to_string(),
+        "pip".to_string(),
+        "install".to_string(),
+        "--upgrade".to_string(),
+        "--disable-pip-version-check".to_string(),
+        "--no-input".to_string(),
+        "--retries".to_string(),
+        PIP_RETRIES.to_string(),
+        "--timeout".to_string(),
+        PIP_TIMEOUT_SECS.to_string(),
+    ];
+    if let Some(url) = index_url {
+        args.push("--index-url".to_string());
+        args.push(url.to_string());
+    }
+    args.extend(
+        REQUIRED_PYTHON_PACKAGES
+            .iter()
+            .map(|item| (*item).to_string()),
+    );
+    args
+}
+
+fn compact_error_for_user(error: &str) -> String {
+    let compact = error
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(3)
+        .collect::<Vec<&str>>()
+        .join(" ");
+    if compact.chars().count() > 240 {
+        compact.chars().take(240).collect::<String>()
+    } else {
+        compact
+    }
+}
+
+fn managed_venv_python_path(venv_dir: &Path) -> PathBuf {
+    managed_venv_python_path_for_os(venv_dir, std::env::consts::OS)
+}
+
+fn managed_venv_python_path_for_os(venv_dir: &Path, os: &str) -> PathBuf {
+    if os == "windows" {
+        venv_dir.join("Scripts").join("python.exe")
+    } else {
+        venv_dir.join("bin").join("python")
+    }
+}
+
+fn run_command_capture(command: &mut Command, label: &str) -> Result<(), String> {
+    let output = command
+        .output()
+        .map_err(|err| format!("{label}失败: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(format!("{label}失败: {}", command_output_summary(&output)))
+}
+
+fn run_command_capture_with_retries(command: &mut Command, label: &str) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 1..=UV_INSTALL_RETRIES {
+        match run_command_capture(command, label) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = format!("第 {attempt} 次失败：{err}");
+                if attempt < UV_INSTALL_RETRIES {
+                    std::thread::sleep(Duration::from_secs(UV_RETRY_SLEEP_SECS));
+                }
+            }
+        }
+    }
+    Err(format!("{last_err}（共重试 {UV_INSTALL_RETRIES} 次）"))
+}
+
+fn command_output_summary(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!("退出码 {:?}", output.status.code())
+}
+
+fn ensure_required_python_imports(python: &Path) -> Result<(), String> {
+    let missing = missing_required_python_imports(python);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!("Python 依赖缺失: {}", missing.join(", ")))
+}
+
+fn missing_required_python_imports(python: &Path) -> Vec<String> {
+    REQUIRED_PYTHON_IMPORTS
+        .iter()
+        .filter_map(|module_name| {
+            let code = format!("import {module_name}");
+            let ok = Command::new(python)
+                .args(["-c", &code])
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false);
+            if ok {
+                None
+            } else {
+                Some((*module_name).to_string())
+            }
+        })
+        .collect()
 }
 
 fn install_runtime_from_archive_internal(
@@ -674,6 +1024,7 @@ fn install_runtime_from_archive_internal(
             PYTHON_MIN_MAJOR, PYTHON_MIN_MINOR
         ));
     }
+    ensure_required_python_imports(&staging_python)?;
 
     let relative_python = staging_python
         .strip_prefix(&staging_dir)
@@ -763,8 +1114,8 @@ fn run_worker_request(request: Value, app: &AppHandle) -> Result<Value, String> 
         .ok_or_else(|| "worker returned empty response".to_string())?
         .map_err(|err| format!("failed to read worker response: {err}"))?;
 
-    let payload: Value =
-        serde_json::from_str(&first_line).map_err(|err| format!("invalid worker response: {err}"))?;
+    let payload: Value = serde_json::from_str(&first_line)
+        .map_err(|err| format!("invalid worker response: {err}"))?;
 
     let _ = child.wait();
     Ok(payload)
@@ -784,6 +1135,7 @@ fn worker_command(app: &AppHandle) -> Result<Command, String> {
             command.arg(&worker_script);
             command.current_dir(&project_root);
             command.env("PYTHONPATH", &project_root);
+            apply_worker_python_env(&mut command);
             return Ok(command);
         }
 
@@ -793,26 +1145,36 @@ fn worker_command(app: &AppHandle) -> Result<Command, String> {
             command.args(["run", "python"]);
             command.arg(&worker_script);
             command.current_dir(&project_root);
+            apply_worker_python_env(&mut command);
             return Ok(command);
         }
     }
 
     // Fallback: use the configured Python binary directly.
-    // Set CWD + PYTHONPATH so bulk_email_sender is importable; third-party deps
-    // (openpyxl) may be absent in base Python – xlsx loading will fail gracefully.
-    let runtime = resolve_python_runtime(app)
-        .ok_or_else(|| "未找到可用 Python 运行时，请先在客户端完成 Python 运行时设置".to_string())?;
+    // resolve_python_runtime only accepts a runtime after required imports pass.
+    let runtime = resolve_python_runtime(app).ok_or_else(|| {
+        "未找到可用 Python 运行时，请先在客户端完成 Python 运行时设置".to_string()
+    })?;
     let mut command = Command::new(runtime.executable_path);
     command.arg(worker_script);
     command.current_dir(&project_root);
     command.env("PYTHONPATH", &project_root);
+    apply_worker_python_env(&mut command);
     Ok(command)
+}
+
+fn apply_worker_python_env(command: &mut Command) {
+    command.env("PYTHONIOENCODING", "utf-8");
+    command.env("PYTHONUTF8", "1");
 }
 
 fn find_project_python(project_root: &Path) -> Option<PathBuf> {
     let candidates = if cfg!(target_os = "windows") {
         vec![
-            project_root.join(".venv").join("Scripts").join("python.exe"),
+            project_root
+                .join(".venv")
+                .join("Scripts")
+                .join("python.exe"),
             project_root.join(".venv").join("python.exe"),
         ]
     } else {
@@ -845,9 +1207,7 @@ fn resolve_worker_script(app: &AppHandle) -> Result<PathBuf, String> {
 
     for candidate in &dev_candidates {
         if candidate.exists() {
-            return candidate
-                .canonicalize()
-                .or_else(|_| Ok(candidate.clone()));
+            return candidate.canonicalize().or_else(|_| Ok(candidate.clone()));
         }
     }
 
@@ -873,7 +1233,9 @@ fn resolve_worker_script(app: &AppHandle) -> Result<PathBuf, String> {
         .map(|path| path.to_string_lossy().to_string())
         .collect::<Vec<String>>()
         .join(" | ");
-    Err(format!("未找到 worker.py，请检查打包资源配置（已检查：{searched}）"))
+    Err(format!(
+        "未找到 worker.py，请检查打包资源配置（已检查：{searched}）"
+    ))
 }
 
 fn resolve_runtime_status(app: &AppHandle) -> RuntimeStatus {
@@ -912,7 +1274,9 @@ fn resolve_python_runtime(app: &AppHandle) -> Option<PythonRuntime> {
         if let Some(path) = config.python_path {
             let configured = PathBuf::from(path);
             if let Some(version) = probe_python_version(&configured) {
-                if is_supported_python_version(&version) {
+                if is_supported_python_version(&version)
+                    && missing_required_python_imports(&configured).is_empty()
+                {
                     return Some(PythonRuntime {
                         source: "configured".to_string(),
                         executable_path: configured,
@@ -926,7 +1290,9 @@ fn resolve_python_runtime(app: &AppHandle) -> Option<PythonRuntime> {
     for candidate in ["python3", "python"] {
         let executable = PathBuf::from(candidate);
         if let Some(version) = probe_python_version(&executable) {
-            if is_supported_python_version(&version) {
+            if is_supported_python_version(&version)
+                && missing_required_python_imports(&executable).is_empty()
+            {
                 return Some(PythonRuntime {
                     source: "system".to_string(),
                     executable_path: executable,
@@ -1015,10 +1381,7 @@ fn select_manifest_bundle<'a>(
     manifest: &'a RuntimeManifest,
     target: &str,
 ) -> Option<&'a RuntimeManifestBundle> {
-    manifest
-        .bundles
-        .iter()
-        .find(|item| item.target == target)
+    manifest.bundles.iter().find(|item| item.target == target)
 }
 
 fn resolve_bundle_download_urls(bundle: &RuntimeManifestBundle) -> Vec<String> {
@@ -1065,7 +1428,10 @@ fn is_localhost_http_url(url: &str) -> bool {
     let host_port = suffix.split('/').next().unwrap_or_default();
     let authority = host_port.split('@').next_back().unwrap_or(host_port);
     let host = if let Some(ipv6) = authority.strip_prefix('[') {
-        ipv6.split(']').next().unwrap_or_default().to_ascii_lowercase()
+        ipv6.split(']')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
     } else {
         authority
             .split(':')
@@ -1078,10 +1444,7 @@ fn is_localhost_http_url(url: &str) -> bool {
 
 fn load_runtime_manifest(manifest_url: &str) -> Result<RuntimeManifest, String> {
     let body = if manifest_url.starts_with("http://") || manifest_url.starts_with("https://") {
-        reqwest::blocking::get(manifest_url)
-            .map_err(|err| format!("下载 manifest 失败: {err}"))?
-            .error_for_status()
-            .map_err(|err| format!("manifest 响应异常: {err}"))?
+        http_get_with_retries(manifest_url, "下载 manifest")?
             .text()
             .map_err(|err| format!("读取 manifest 内容失败: {err}"))?
     } else if manifest_url.starts_with("file://") {
@@ -1091,35 +1454,92 @@ fn load_runtime_manifest(manifest_url: &str) -> Result<RuntimeManifest, String> 
         fs::read_to_string(manifest_url).map_err(|err| format!("读取 manifest 失败: {err}"))?
     };
 
-    serde_json::from_str::<RuntimeManifest>(&body).map_err(|err| format!("manifest JSON 格式错误: {err}"))
+    serde_json::from_str::<RuntimeManifest>(&body)
+        .map_err(|err| format!("manifest JSON 格式错误: {err}"))
 }
 
 fn download_bundle_to_path(url: &str, destination: &Path) -> Result<(), String> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("创建下载目录失败: {err}"))?;
     }
+    let temp_destination = temporary_download_path(destination);
+    let _ = fs::remove_file(&temp_destination);
 
-    if url.starts_with("http://") || url.starts_with("https://") {
-        let mut response = reqwest::blocking::get(url)
-            .map_err(|err| format!("下载 runtime 包失败: {err}"))?
-            .error_for_status()
-            .map_err(|err| format!("runtime 包响应异常: {err}"))?;
-        let mut target = File::create(destination).map_err(|err| format!("创建下载文件失败: {err}"))?;
-        std::io::copy(&mut response, &mut target).map_err(|err| format!("写入下载文件失败: {err}"))?;
-        return Ok(());
-    }
-
-    let source_path = if url.starts_with("file://") {
-        PathBuf::from(url.trim_start_matches("file://"))
+    let result = if url.starts_with("http://") || url.starts_with("https://") {
+        let mut response = http_get_with_retries(url, "下载 runtime 包")?;
+        let mut target =
+            File::create(&temp_destination).map_err(|err| format!("创建下载文件失败: {err}"))?;
+        std::io::copy(&mut response, &mut target)
+            .map_err(|err| format!("写入下载文件失败: {err}"))?;
+        target
+            .flush()
+            .map_err(|err| format!("保存下载文件失败: {err}"))?;
+        drop(target);
+        replace_downloaded_file(&temp_destination, destination)
     } else {
-        PathBuf::from(url)
+        let source_path = if url.starts_with("file://") {
+            PathBuf::from(url.trim_start_matches("file://"))
+        } else {
+            PathBuf::from(url)
+        };
+
+        if !source_path.exists() {
+            Err("runtime 包地址无效，文件不存在".to_string())
+        } else {
+            fs::copy(source_path, &temp_destination)
+                .map_err(|err| format!("复制 runtime 包失败: {err}"))?;
+            replace_downloaded_file(&temp_destination, destination)
+        }
     };
 
-    if !source_path.exists() {
-        return Err("runtime 包地址无效，文件不存在".to_string());
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_destination);
     }
-    fs::copy(source_path, destination).map_err(|err| format!("复制 runtime 包失败: {err}"))?;
-    Ok(())
+    result
+}
+
+fn temporary_download_path(destination: &Path) -> PathBuf {
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download");
+    destination.with_file_name(format!("{file_name}.download"))
+}
+
+fn replace_downloaded_file(temp_destination: &Path, destination: &Path) -> Result<(), String> {
+    if destination.exists() {
+        fs::remove_file(destination).map_err(|err| format!("清理旧下载文件失败: {err}"))?;
+    }
+    fs::rename(temp_destination, destination).map_err(|err| format!("保存下载文件失败: {err}"))
+}
+
+fn http_get_with_retries(url: &str, label: &str) -> Result<reqwest::blocking::Response, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(HTTP_DOWNLOAD_TIMEOUT_SECS))
+        .build()
+        .map_err(|err| format!("{label}初始化失败: {err}"))?;
+    let mut last_error = String::new();
+
+    for attempt in 1..=HTTP_DOWNLOAD_RETRIES {
+        match client.get(url).send() {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => return Ok(response),
+                Err(err) => {
+                    last_error = format!("{label}第 {attempt} 次响应异常: {err}");
+                }
+            },
+            Err(err) => {
+                last_error = format!("{label}第 {attempt} 次失败: {err}");
+            }
+        }
+        if attempt < HTTP_DOWNLOAD_RETRIES {
+            std::thread::sleep(Duration::from_secs(UV_RETRY_SLEEP_SECS));
+        }
+    }
+
+    Err(format!(
+        "{last_error}。已重试 {HTTP_DOWNLOAD_RETRIES} 次，请检查网络后重试"
+    ))
 }
 
 fn verify_sha256_checksum(path: &Path, expected: &str) -> Result<(), String> {
@@ -1166,7 +1586,8 @@ fn read_runtime_config(app: &AppHandle) -> Result<RuntimeConfig, String> {
         return Ok(RuntimeConfig::default());
     }
 
-    let text = fs::read_to_string(config_path).map_err(|err| format!("读取运行时配置失败: {err}"))?;
+    let text =
+        fs::read_to_string(config_path).map_err(|err| format!("读取运行时配置失败: {err}"))?;
     serde_json::from_str(&text).map_err(|err| format!("运行时配置格式错误: {err}"))
 }
 
@@ -1193,7 +1614,8 @@ fn read_app_settings(app: &AppHandle) -> Result<AppSettings, String> {
     if !settings_path.exists() {
         return Ok(AppSettings::default());
     }
-    let text = fs::read_to_string(settings_path).map_err(|err| format!("读取应用设置失败: {err}"))?;
+    let text =
+        fs::read_to_string(settings_path).map_err(|err| format!("读取应用设置失败: {err}"))?;
     serde_json::from_str(&text).map_err(|err| format!("应用设置格式错误: {err}"))
 }
 
@@ -1344,7 +1766,8 @@ fn extract_zip_archive(source: &Path, destination: &Path) -> Result<(), String> 
 
         let mut output_file =
             File::create(&output_path).map_err(|err| format!("写入解压文件失败: {err}"))?;
-        std::io::copy(&mut entry, &mut output_file).map_err(|err| format!("写入解压文件失败: {err}"))?;
+        std::io::copy(&mut entry, &mut output_file)
+            .map_err(|err| format!("写入解压文件失败: {err}"))?;
 
         #[cfg(unix)]
         if let Some(mode) = entry.unix_mode() {
@@ -1356,18 +1779,12 @@ fn extract_zip_archive(source: &Path, destination: &Path) -> Result<(), String> 
 
 fn find_python_executable(root: &Path) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    for entry in WalkDir::new(root)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
+    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
         if !entry.file_type().is_file() {
             continue;
         }
         let file_name = entry.file_name().to_string_lossy().to_lowercase();
-        if file_name == "python3"
-            || file_name == "python"
-            || file_name == "python.exe"
-        {
+        if file_name == "python3" || file_name == "python" || file_name == "python.exe" {
             candidates.push(entry.path().to_path_buf());
         }
     }
@@ -1380,7 +1797,10 @@ fn find_python_executable(root: &Path) -> Option<PathBuf> {
             .unwrap_or("")
             .to_lowercase();
         let is_python3 = usize::from(file_name == "python3");
-        let is_bin = usize::from(path.components().any(|component| component.as_os_str() == "bin"));
+        let is_bin = usize::from(
+            path.components()
+                .any(|component| component.as_os_str() == "bin"),
+        );
         (1 - is_python3, 1 - is_bin, depth)
     });
     candidates
@@ -1418,10 +1838,15 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        bundle_has_checksum, collect_manifest_sources, is_localhost_http_url, is_supported_python_version,
-        parse_python_version, resolve_bundle_download_urls, runtime_target_key, select_manifest_bundle,
-        validate_remote_url_scheme, RuntimeManifest, RuntimeManifestBundle,
+        apply_worker_python_env, build_pip_install_args, bundle_has_checksum,
+        collect_manifest_sources, compact_error_for_user, is_localhost_http_url,
+        is_supported_python_version, managed_venv_python_path_for_os, parse_python_version,
+        resolve_bundle_download_urls, runtime_target_key, select_manifest_bundle,
+        validate_remote_url_scheme, RuntimeManifest, RuntimeManifestBundle, PIP_RETRIES,
+        PIP_TIMEOUT_SECS,
     };
+    use std::path::Path;
+    use std::process::Command;
 
     #[test]
     fn parses_python_version_line() {
@@ -1448,6 +1873,71 @@ mod tests {
     }
 
     #[test]
+    fn resolves_managed_venv_python_path_by_platform() {
+        let root = Path::new("runtime").join("venv");
+
+        assert_eq!(
+            managed_venv_python_path_for_os(&root, "windows"),
+            root.join("Scripts").join("python.exe")
+        );
+        assert_eq!(
+            managed_venv_python_path_for_os(&root, "macos"),
+            root.join("bin").join("python")
+        );
+        assert_eq!(
+            managed_venv_python_path_for_os(&root, "linux"),
+            root.join("bin").join("python")
+        );
+    }
+
+    #[test]
+    fn builds_pip_install_args_with_retry_timeout_and_mirror() {
+        let args = build_pip_install_args(Some("https://pypi.tuna.tsinghua.edu.cn/simple"));
+
+        assert!(args.contains(&"--disable-pip-version-check".to_string()));
+        assert!(args.contains(&"--no-input".to_string()));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--retries" && pair[1] == PIP_RETRIES));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--timeout" && pair[1] == PIP_TIMEOUT_SECS));
+        assert!(args.windows(2).any(|pair| pair[0] == "--index-url"
+            && pair[1] == "https://pypi.tuna.tsinghua.edu.cn/simple"));
+        assert!(args.iter().any(|item| item.starts_with("openpyxl")));
+    }
+
+    #[test]
+    fn applies_utf8_environment_to_worker_python_process() {
+        let mut command = Command::new("python");
+
+        apply_worker_python_env(&mut command);
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|item| item.to_string_lossy().to_string()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(envs
+            .iter()
+            .any(|(key, value)| key == "PYTHONIOENCODING" && value.as_deref() == Some("utf-8")));
+        assert!(envs
+            .iter()
+            .any(|(key, value)| key == "PYTHONUTF8" && value.as_deref() == Some("1")));
+    }
+
+    #[test]
+    fn compacts_dependency_install_errors_for_nontechnical_users() {
+        let message = compact_error_for_user("first line\n\nsecond line\nthird line\nfourth line");
+
+        assert_eq!(message, "first line second line third line");
+    }
+
+    #[test]
     fn selects_bundle_by_target() {
         let manifest = RuntimeManifest {
             bundles: vec![
@@ -1466,14 +1956,18 @@ mod tests {
             ],
         };
 
-        let bundle = select_manifest_bundle(&manifest, "windows-x86_64").expect("bundle should exist");
+        let bundle =
+            select_manifest_bundle(&manifest, "windows-x86_64").expect("bundle should exist");
         assert_eq!(bundle.url, "https://cdn.example.com/win.zip");
     }
 
     #[test]
     fn collects_manifest_sources_with_dedup() {
         let sources = collect_manifest_sources(
-            Some("https://a.example.com/manifest.json, https://b.example.com/manifest.json".to_string()),
+            Some(
+                "https://a.example.com/manifest.json, https://b.example.com/manifest.json"
+                    .to_string(),
+            ),
             Some(vec![
                 "https://b.example.com/manifest.json".to_string(),
                 "https://c.example.com/manifest.json".to_string(),

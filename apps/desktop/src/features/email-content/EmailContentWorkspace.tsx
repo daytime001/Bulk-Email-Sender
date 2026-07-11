@@ -16,6 +16,7 @@ import { Textarea as UiTextarea } from '@/components/ui/textarea';
 const { Text } = Typography;
 
 const TEACHER_TOKEN = '{teacher_name}';
+const RESEARCH_DIRECTION_TOKEN = '{research_direction}';
 const SENDER_TOKEN = '{sender_name}';
 const DATE_TOKEN = '{send_date}';
 const REQUIRED_TEMPLATE_TOKENS = [TEACHER_TOKEN, SENDER_TOKEN, DATE_TOKEN] as const;
@@ -155,8 +156,9 @@ function EmailContentWorkspaceInner({
 
           <div className="overflow-x-auto whitespace-nowrap rounded-md border border-sky-100 bg-sky-50 px-3 py-2 text-xs text-slate-700">
             占位符完整性检查：<span className="font-mono">{TEACHER_TOKEN}</span>=收件人姓名；
+            <span className="font-mono">{RESEARCH_DIRECTION_TOKEN}</span>=研究方向；
             <span className="font-mono">{SENDER_TOKEN}</span>、<span className="font-mono">{DATE_TOKEN}</span>
-            在发送时会自动渲染到正文右下方（缺少任一占位符将禁止发送）
+            在发送时会自动渲染到正文右下方（研究方向可选，其余固定占位符缺少时将禁止发送）
           </div>
 
           <div className="space-y-3">

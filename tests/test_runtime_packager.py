@@ -14,7 +14,11 @@ from bulk_email_sender.runtime_smoke import create_mock_runtime
 
 
 def test_build_runtime_bundle_and_sha256(tmp_path: Path) -> None:
-    runtime_root = create_mock_runtime(runtime_root=tmp_path / "runtime_root", python_version="3.11.8")
+    runtime_root = create_mock_runtime(
+        runtime_root=tmp_path / "runtime_root",
+        python_version="3.11.8",
+        installed_imports=("openpyxl",),
+    )
     (runtime_root / "lib" / "site.py").write_text("print('ok')\n", encoding="utf-8")
 
     bundle_path = tmp_path / "python-runtime-macos-aarch64.zip"
@@ -46,6 +50,16 @@ def test_build_runtime_bundle_rejects_low_python_version(tmp_path: Path) -> None
     runtime_root = create_mock_runtime(runtime_root=tmp_path / "runtime_root", python_version="3.8.18")
 
     with pytest.raises(ValueError, match="版本过低"):
+        build_runtime_bundle(
+            runtime_root=runtime_root,
+            bundle_path=tmp_path / "python-runtime-macos-aarch64.zip",
+        )
+
+
+def test_build_runtime_bundle_rejects_missing_required_packages(tmp_path: Path) -> None:
+    runtime_root = create_mock_runtime(runtime_root=tmp_path / "runtime_root", python_version="3.11.8")
+
+    with pytest.raises(ValueError, match="openpyxl"):
         build_runtime_bundle(
             runtime_root=runtime_root,
             bundle_path=tmp_path / "python-runtime-macos-aarch64.zip",

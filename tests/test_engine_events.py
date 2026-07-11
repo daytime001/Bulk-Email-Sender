@@ -226,6 +226,30 @@ def test_send_engine_renders_sender_name_and_send_date_as_signature_block(tmp_pa
     assert "text-align:center" in html_text
 
 
+def test_send_engine_renders_research_direction_placeholder(tmp_path: Path) -> None:
+    job = _build_job(tmp_path)
+    job = replace(
+        job,
+        template=Template(
+            subject="咨询{research_direction}方向",
+            body_text="尊敬的{teacher_name}老师：\n\n我对{research_direction}方向很感兴趣。\n\n{sender_name}\n{send_date}",
+            body_html=None,
+        ),
+        recipients=[Recipient(email="teacher@example.com", name="魏中信", research_direction="储能")],
+    )
+    smtp_client = FakeSMTPClient()
+    sent_store = SentStore(job.sent_store_file)
+    engine = SendEngine(smtp_client=smtp_client, sent_store=sent_store)
+
+    list(engine.send(job))
+
+    message = smtp_client.messages[0]
+    plain = message.get_body(preferencelist=("plain",))
+    assert message["Subject"] == "咨询储能方向"
+    assert plain is not None
+    assert "我对储能方向很感兴趣" in plain.get_content()
+
+
 def test_send_engine_does_not_auto_append_signature_when_placeholder_missing(tmp_path: Path) -> None:
     job = _build_job(tmp_path)
     job = replace(

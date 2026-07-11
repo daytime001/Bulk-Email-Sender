@@ -23,7 +23,7 @@ class JsonLineWriter:
         self._lock = threading.Lock()
 
     def write_line(self, payload: dict[str, Any]) -> None:
-        text = json.dumps(payload, ensure_ascii=False)
+        text = json.dumps(payload, ensure_ascii=True)
         with self._lock:
             self.stream.write(text + "\n")
             self.stream.flush()
@@ -242,9 +242,10 @@ def _resolve_recipients(payload: dict[str, Any]) -> list[Recipient]:
                 raise RecipientLoadError(f"Invalid recipients[{index}] payload")
             email = _validate_email(str(item.get("email", "")).strip(), field_name=f"recipients[{index}].email")
             name = str(item.get("name", "")).strip()
+            research_direction = str(item.get("research_direction", "")).strip()
             if not name:
                 raise RecipientLoadError(f"Invalid recipients[{index}] data")
-            recipients.append(Recipient(email=email, name=name))
+            recipients.append(Recipient(email=email, name=name, research_direction=research_direction))
         return recipients
 
     recipients_file = payload.get("recipients_file")

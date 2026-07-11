@@ -176,6 +176,7 @@ class SendEngine:
         variables = {
             "teacher_name": teacher_name,
             "teacher_email": recipient.email,
+            "research_direction": recipient.research_direction,
             "sender_name": signature_name,
             "signature_name": signature_name,
             "send_date": send_date,
