@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "bulk-email-sender"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "lettre",
  "reqwest 0.12.28",

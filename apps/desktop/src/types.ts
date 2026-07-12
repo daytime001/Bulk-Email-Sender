@@ -17,7 +17,7 @@ export type WorkerEvent =
   | { type: 'job_cancelled'; job_id: string; success: number; failed: number; skipped: number; total: number }
   | { type: 'cancel_requested' }
   | { type: 'smtp_test_succeeded' }
-  | { type: 'recipients_loaded'; stats: RecipientStats; recipients_preview: Recipient[] }
+  | { type: 'recipients_loaded'; stats: RecipientStats; recipients: Recipient[]; recipients_preview: Recipient[] }
   | { type: 'error'; error: string };
 
 export interface Recipient {
@@ -39,6 +39,7 @@ export interface RecipientStats {
 
 export interface LoadRecipientsResult {
   stats: RecipientStats;
+  recipients: Recipient[];
   recipientsPreview: Recipient[];
 }
 

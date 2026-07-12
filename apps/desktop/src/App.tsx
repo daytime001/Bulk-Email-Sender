@@ -541,7 +541,7 @@ function AppContent() {
     }
     try {
       const result = await loadRecipients(recipientsPath);
-      setRecipients(result.recipientsPreview);
+      setRecipients(result.recipients);
       setRecipientsStats(result.stats);
       message.success(
         `导入成功：总数 ${result.stats.total_rows} 条，可发送 ${result.stats.sendable_rows} 条，无效邮箱 ${result.stats.invalid_email_rows} 条，缺姓名 ${result.stats.missing_name_rows} 条`,

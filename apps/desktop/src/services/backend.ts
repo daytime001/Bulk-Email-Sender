@@ -40,6 +40,7 @@ export async function loadRecipients(path: string): Promise<LoadRecipientsResult
         duplicate_rows: 0,
         empty_rows: 0,
       },
+      recipients: preview,
       recipientsPreview: preview,
     };
   }
@@ -54,6 +55,7 @@ export async function loadRecipients(path: string): Promise<LoadRecipientsResult
 
   return {
     stats: event.stats,
+    recipients: event.recipients ?? event.recipients_preview,
     recipientsPreview: event.recipients_preview,
   };
 }

@@ -141,7 +141,12 @@ function RecipientsWorkspaceInner({
             rowKey={(row, index) => `${row.email}-${index ?? 0}`}
             columns={recipientsColumns}
             dataSource={recipients}
-            pagination={{ pageSize: 8 }}
+            pagination={{
+              pageSize: 10,
+              showSizeChanger: true,
+              pageSizeOptions: [10, 20, 50, 100],
+              showTotal: (total) => `共 ${total} 条`,
+            }}
           />
         </UiCardContent>
       </UiCard>

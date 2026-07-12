@@ -66,7 +66,8 @@ class Worker:
             {
                 "type": "recipients_loaded",
                 "stats": asdict(result.stats),
-                "recipients_preview": [asdict(recipient) for recipient in result.recipients[:20]],
+                "recipients": [asdict(recipient) for recipient in result.recipients],
+                "recipients_preview": [asdict(recipient) for recipient in result.recipients],
             }
         )
 

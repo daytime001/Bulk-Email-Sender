@@ -77,6 +77,32 @@ def test_worker_load_recipients_command_returns_quality_stats(tmp_path: Path) ->
     assert writer.lines[-1]["stats"]["missing_name_rows"] == 1
 
 
+def test_worker_load_recipients_command_returns_all_recipients_for_paginated_preview(tmp_path: Path) -> None:
+    recipients_path = tmp_path / "teachers-many.json"
+    recipients_path.write_text(
+        json.dumps(
+            [
+                {"email": f"teacher{index}@example.com", "name": f"张教授{index}"}
+                for index in range(25)
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    writer = DummyWriter()
+    worker = Worker(writer=writer)
+    worker.handle_message(
+        {
+            "type": "load_recipients",
+            "protocol": 1,
+            "payload": {"path": str(recipients_path)},
+        }
+    )
+
+    assert len(writer.lines[-1]["recipients"]) == 25
+    assert len(writer.lines[-1]["recipients_preview"]) == 25
+
+
 def test_build_job_config_preserves_research_direction() -> None:
     job = _build_job_config(
         {

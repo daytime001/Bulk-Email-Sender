@@ -10,6 +10,8 @@
 - 已完成：定位并修复部分 Windows 电脑上中文路径经 worker 管道传输后被 Python 误解码，导致真实文件被判定不存在的问题。
 - 已完成：定位并修复 JSON 导入时 worker 响应含中文导致 Rust 读取 stdout 报非 UTF-8 的问题。
 - 已完成：新增收件人“研究方向”字段，支持 JSON/XLSX 解析与 `{research_direction}` 模板渲染。
+- 已完成：定位并修复导入后只发送前 20 条收件人的预览列表误用问题。
+- 已完成：收件人明细改为预览全部解析结果，由表格分页控制显示。
 - 进行中：无。
 - 待开始：如需进一步发布，重新打包 Windows 客户端给用户验证。
 
@@ -30,6 +32,8 @@
 | worker 协议输出改为 ASCII-safe JSON | Rust 读取 worker stdout 要求 UTF-8；Windows Python 若按本地代码页输出中文，会产生非 UTF-8 字节 | 继续用 `ensure_ascii=False` 直接输出中文 |
 | JSON 文件读取增加 GB18030 兜底 | 国内 Windows 用户可能用旧工具保存 ANSI/GBK 中文 JSON | 只支持 UTF-8 JSON |
 | 研究方向占位符设为可选 | 老模板不应因为新增字段而突然无法发送；用户需要时可在正文或主题使用 `{research_direction}` | 把研究方向加入必填占位符 |
+| worker 同时返回完整名单和预览名单 | 发送必须使用完整收件人列表，UI 仍可保留前 20 条预览兼容字段 | 继续把 `recipients_preview` 当作实际发送列表 |
+| 收件人预览不再限制 20 条 | 用户希望界面可分页查看全部收件人；分页应由前端表格负责 | worker 仍只返回前 20 条预览 |
 
 ## 待解决问题
 
@@ -37,6 +41,8 @@
 - [x] 问题：读取 JSON 时 worker 响应可能包含中文，部分 Windows Python 按本地编码写 stdout，Rust 按 UTF-8 读取失败。处理：worker 协议输出统一使用 ASCII-safe JSON 转义。
 - [x] 问题：用户 JSON 文件可能是 GBK/GB18030 编码。处理：读取 JSON 时优先 `utf-8-sig`，再尝试 `gb18030`。
 - [x] 问题：XLSX 需要新增“研究方向”列并可用于邮件模板。处理：收件人模型新增 `research_direction`，XLSX/JSON 解析保留该字段，发送模板新增 `{research_direction}` 变量，前端提示和预览表同步展示。
+- [x] 问题：用户反馈单次只能发 20 封。处理：确认根因是 worker 只返回 `recipients_preview[:20]`，前端将其作为正式发送列表；现改为 worker 返回完整 `recipients`，前端发送使用完整列表。
+- [x] 问题：收件人明细希望预览全部。处理：`recipients_preview` 也返回完整解析结果，前端表格启用分页和总数显示。
 - [x] 问题：打包后的 Windows app 只安装 Python 解释器但未安装 XLSX 解析依赖。处理：配置 Python 时创建应用专用 venv 并安装 `openpyxl`。
 - [x] 问题：弱网下载可能失败或卡住。处理：runtime 下载增加 HTTP 超时与重试，pip 安装增加重试、超时和多镜像兜底。
 - [x] 问题：弱网中断可能留下半个安装包。处理：下载先写入 `.download` 临时文件，完整写完后再替换正式文件；Python 未安装成功时会重新下载安装器。
@@ -70,6 +76,7 @@
 - 已验证：新增测试覆盖 worker 响应协议输出为纯 ASCII，中文姓名仍可被 JSON 正确还原。
 - 已验证：新增测试覆盖 GB18030 编码 JSON 文件读取。
 - 已验证：新增测试覆盖 JSON/XLSX 研究方向解析、worker 透传和邮件模板渲染。
+- 已验证：新增测试覆盖导入 25 条时完整 `recipients` 和 `recipients_preview` 均返回 25 条。
 - 结果：路径不可见和缺依赖是两个不同问题；缺依赖已修复。
 
 ## 风险与异常
@@ -89,6 +96,8 @@
 - 2026-07-11：修复 worker 管道编码与路径文本归一化问题，避免中文路径真实存在但被误报找不到。
 - 2026-07-11：修复 JSON 导入时 worker stdout 非 UTF-8 问题，并支持 GB18030 编码 JSON。
 - 2026-07-11：新增研究方向字段与 `{research_direction}` 模板变量，并更新内置收件人示例。
+- 2026-07-12：修复发送名单误用预览列表导致单次最多 20 封的问题。
+- 2026-07-12：取消收件人预览 20 条限制，改为全量预览分页展示。
 
 ## 参考资料
 

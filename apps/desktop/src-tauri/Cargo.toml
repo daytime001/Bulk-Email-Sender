@@ -1,6 +1,6 @@
 [package]
 name = "bulk-email-sender"
-version = "0.1.3"
+version = "0.1.4"
 description = "Desktop UI for Bulk-Email-Sender"
 authors = ["xin"]
 edition = "2021"
